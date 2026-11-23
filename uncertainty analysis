@@ -1,0 +1,1191 @@
+# ================================================================
+# MA et al. (2020) PCL / CALB, NIWA MODEL
+# PREDICTION UNCERTAINTY FOLLOWING VAN MOURIK et al. (2014)
+#
+#   van Mourik S, ter Braak C, Stigter H, Molenaar J (2014).
+#   Prediction uncertainty assessment of a systems biology model
+#   requires a sample of the full probability distribution of its
+#   parameters. PeerJ 2:e433. DOI 10.7717/peerj.433
+#
+# This script is a Python port of their MATLAB code
+# (Main.m, Makedistribution.m, DEMCz.m, logposterior.m,
+#  makeY.m, Gelman.m, plots.m) applied to the NIWA
+# reaction-diffusion-erosion model and the Ma et al. data.
+#
+# PART I  : posterior sample by DE-MCz (ter Braak & Vrugt 2008)
+#           exactly as in their DEMCz.m / Makedistribution.m:
+#           - parameters in log10, uniform prior inside bounds
+#           - m = 4 chains started at theta_PML + 0.001 N(0,1)
+#           - initial archive Z of 10*d + 1 states near theta_PML
+#           - proposal: gamma = 2.38/sqrt(2d) times the difference of
+#             two archive states (excluding the m most recent rows),
+#             plus jitter 1e-5
+#           - archive extended with the m current states every
+#             N_THIN iterations
+#           - Gelman-Rubin R every 500 iterations (second half)
+#           - burn-in: first N_ITER/N_THIN saved states (25 % for m=4)
+#           - N_SAMPLE states drawn at random (with replacement)
+# PART II : computational uncertainty analysis with that sample
+#           (their Q_alpha quantifier is not used here)
+#           - envelope: at each time point discard the
+#             round((1-alpha) N/2) largest and smallest predictions,
+#             plot min-max of the rest
+#
+# Choices that the paper leaves to the user (data dependent):
+#   - sigma: the paper used simulated data with known noise
+#     (sigma = 0.1 y). Ma et al. give no uncertainty, so sigma is
+#     fixed per response (pooled RMSE of the NIWA fits, t > 0).
+#   - theta_PML: the global deterministic NIWA fit for each grade
+#     (differential evolution over [1e-8, 50], then TRF refinement).
+#     Several rates sit on the upper bound, so the starting states are
+#     moved just inside the search domain (EDGE_MARGIN).
+#   - search domain: BOUNDS_MODE (see settings).
+#
+# HOW TO RUN
+#   Save this file, then F5 in Spyder or
+#   python MA_NIWA_vanMourik_50k_GLOBAL.py
+#   Stop at any time and rerun: it resumes from the last checkpoint
+#   (saved every 500 iterations). Redraw figures only:
+#   runfile('MA_NIWA_vanMourik_50k_GLOBAL.py', args='--figures-only')
+# ================================================================
+
+import os
+
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
+import sys
+import time
+import pickle
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy.integrate import solve_ivp
+from scipy.sparse import lil_matrix
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+# ================================================================
+# SETTINGS
+# ================================================================
+
+TEST_MODE = False            # True: short run to check everything works
+
+SEED = 1
+
+# ---- Part I: DE-MCz (their Main.m values) ----
+N_CHAINS = 4                 # nchain
+N_ITER = 50000               # nit, iterations per chain (as in their Main.m)
+N_THIN = 10                  # nthin
+GELMAN_EVERY = 500           # R statistic every 500 iterations
+JITTER = 1.0e-5              # jitter (log10 units)
+INIT_SD = 0.001              # initial scatter around theta_PML (log10)
+EDGE_MARGIN = 0.01           # log10; theta_PML on a bound is moved this far inside
+
+# ---- Search domain (prior bounds) ----
+#   "fit"      : [1e-8, 50] for every parameter, the bounds of your
+#                deterministic NIWA calibration (recommended)
+#   "relative" : [theta_PML / DELTA, theta_PML * DELTA] as in their
+#                Main.m (DELTA = 1e6). Unidentified rates then drift to
+#                very large values where each PDE solve takes 20 s+.
+BOUNDS_MODE = "fit"
+FIT_LOWER = 1.0e-8
+FIT_UPPER = 50.0
+DELTA = 1.0e6
+
+# ---- Part II ----
+N_SAMPLE = 1000              # nsample, states drawn from the posterior
+ALPHA = 0.95                 # alph
+N_PRED_TIME = 100            # nd2, prediction grid on [0, Tf]
+Y_FLOOR = 1.0e-6             # makeY.m clip
+Y_CEIL = 1.0e6
+
+# ---- Figures ----
+SHOW_MEAN_LINE = True        # red pointwise mean over the envelope
+                             # (their plots.m shows the envelope only)
+DPI = 500
+
+# ---- Parallel ----
+N_PARALLEL = min(3, os.cpu_count() or 1)   # grades run at the same time
+
+if TEST_MODE:
+    N_ITER = 600
+    N_SAMPLE = 100
+    DPI = 150
+
+ROOT_OUTPUT_DIR = Path.home() / "Downloads" / (
+    "MA_NIWA_vanMourik_50k_GLOBAL_TEST" if TEST_MODE else "MA_NIWA_vanMourik_50k_GLOBAL"
+)
+ROOT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+MODEL = "NIWA"
+GRADE_ORDER = ["PCL6300", "PCL6500", "PCL6800"]
+
+
+# ================================================================
+# FIXED OBSERVATION ERRORS
+# Pooled RMSE of the three NIWA deterministic fits (global optimum,
+# differential evolution), t > 0 only.
+# ================================================================
+
+SIGMA = {
+    "WL": 3.0160,
+    "Xc": 4.2498,
+    "pH": 0.1321,
+}
+
+
+# ================================================================
+# MODEL CONSTANTS
+# ================================================================
+
+N_GRID = 25
+FILM_THICKNESS_MM = 0.30
+L_THICKNESS_MM = FILM_THICKNESS_MM / 2.0
+DX = L_THICKNESS_MM / N_GRID
+
+S0 = 1.0
+E_INIT = 0.0
+E_T = 0.5
+PH0 = 7.2
+POROSITY_EXP_ENZYME = 1.0
+
+RTOL = 1.0e-8
+ATOL = 1.0e-11
+MAX_STEP = 0.5
+
+T_FINAL = 20.0
+
+
+# ================================================================
+# DATA (Ma et al. 2020)
+# ================================================================
+
+T_MAIN = np.array([0, 1, 2, 4, 6, 8, 12, 16, 20], dtype=float)
+
+DATA = {
+    "PCL6300": {
+        "X_FIXED": 0.65,
+        "xc_obs": np.array([65, 62, 59, 51, 35, 9, 8.8, 8, 6], dtype=float),
+        "wl_obs": np.array([0, 9, 18, 38, 54, 67, 85, 86, 87], dtype=float),
+        "ph_obs": np.array([7.20, 6.64, 6.28, 5.93, 5.57, 4.86, 4.50, 4.34, 4.11]),
+    },
+    "PCL6500": {
+        "X_FIXED": 0.60,
+        "xc_obs": np.array([60, 59, 56, 49, 36, 5, 4, 3, 2], dtype=float),
+        "wl_obs": np.array([0, 9, 16, 38, 54, 70, 82, 83, 84], dtype=float),
+        "ph_obs": np.array([7.20, 6.96, 6.49, 6.02, 5.63, 5.17, 4.72, 4.49, 4.39]),
+    },
+    "PCL6800": {
+        "X_FIXED": 0.60,
+        "xc_obs": np.array([60, 58, 56, 52, 36, 5, 3.5, 3, 2], dtype=float),
+        "wl_obs": np.array([0, 11, 23, 43, 61, 70, 83, 84, 85], dtype=float),
+        "ph_obs": np.array([7.20, 6.86, 6.44, 5.85, 5.51, 5.01, 4.63, 4.29, 4.23]),
+    },
+}
+
+
+# ================================================================
+# PARAMETERS AND theta_PML (global deterministic NIWA fits,
+# differential evolution + TRF refinement, all eight parameters free)
+# ================================================================
+
+NAMES = ["k1", "kc", "kr", "k4", "ka", "ke", "De0", "alpha_pH"]
+
+THETA_PML = {
+    "PCL6300": {
+        "k1": 49.9996450887706, "kc": 2.0557872070185,
+        "kr": 5.87927660711715e-08, "k4": 15.677359294699,
+        "ka": 0.0743102972679917, "ke": 49.9999999500015,
+        "De0": 0.00315541072252713, "alpha_pH": 3.36562718882125,
+    },
+    "PCL6500": {
+        "k1": 2.74930080967386, "kc": 49.9061221605837,
+        "kr": 4.49581542797245e-06, "k4": 49.9999987815237,
+        "ka": 0.0729524796822756, "ke": 49.9998653194092,
+        "De0": 0.00790470820202497, "alpha_pH": 3.13082649043713,
+    },
+    "PCL6800": {
+        "k1": 5.49377250984054, "kc": 49.9979744492913,
+        "kr": 1.16025364526593e-06, "k4": 49.9999940163782,
+        "ka": 0.0883081762342767, "ke": 49.9999999500116,
+        "De0": 0.00459336545026438, "alpha_pH": 3.23650342380737,
+    },
+}
+
+REFERENCE_SSE = {
+    "PCL6300": 228.066478337720,
+    "PCL6500": 137.014719843601,
+    "PCL6800": 287.111414136701,
+}
+
+
+def transform(x):
+    """their transform.m"""
+    return np.log10(x)
+
+
+def backtransform(x):
+    """their backtransform.m"""
+    return 10.0 ** np.asarray(x, dtype=float)
+
+
+# ================================================================
+# NIWA MODEL (functionf.m / makeY.m equivalent)
+# ================================================================
+
+def enzyme_front_diffusion(E, phi, De0, E_surface):
+
+    E_work = np.maximum(np.asarray(E, dtype=float), 0.0).copy()
+    phi = np.clip(np.asarray(phi, dtype=float), 0.0, 1.0)
+
+    # last cell = exposed surface, first cell = symmetry plane
+    E_work[-1] = float(E_surface)
+
+    phi_face = np.maximum(phi[:-1], phi[1:])
+    Dface = De0 * np.power(phi_face, POROSITY_EXP_ENZYME)
+    Jface = -Dface * (E_work[1:] - E_work[:-1]) / DX
+
+    dEdt = np.zeros_like(E_work)
+    dEdt[0] = -(Jface[0] - 0.0) / DX
+    if N_GRID > 2:
+        dEdt[1:-1] = -(Jface[1:] - Jface[:-1]) / DX
+    dEdt[-1] = 0.0
+
+    return dEdt, E_work
+
+
+_SPARSITY = None
+
+
+def jacobian_sparsity():
+
+    global _SPARSITY
+
+    if _SPARSITY is None:
+
+        nf = 6
+        n = nf * N_GRID + 1
+        S = lil_matrix((n, n), dtype=int)
+
+        for f in range(nf):
+            for i in range(N_GRID):
+                row = f * N_GRID + i
+                for g in range(nf):
+                    for j in (i - 1, i, i + 1):
+                        if 0 <= j < N_GRID:
+                            S[row, g * N_GRID + j] = 1
+                S[row, n - 1] = 1
+
+        S[n - 1, :] = 1
+        _SPARSITY = S.tocsr()
+
+    return _SPARSITY
+
+
+def simulate_model(grade, pars, times_h):
+    """
+    NIWA: E + C -> Z_C (k1), Z_C -> E + D (kc), Z_C -> E + A (kr),
+          E + A -> Z_A (k4), Z_A -> E + D (ka), D -> P (ke).
+    Returns weight loss (%), crystallinity (%), bath pH.
+    """
+
+    X_FIXED = DATA[grade]["X_FIXED"]
+
+    k1, kc, kr = pars["k1"], pars["kc"], pars["kr"]
+    k4, ka, ke = pars["k4"], pars["ka"], pars["ke"]
+    De0 = pars["De0"]
+
+    times_h = np.asarray(times_h, dtype=float)
+
+    def rhs(t, y):
+
+        E, C, A, ZC, ZA, D = y[:-1].reshape(6, N_GRID)
+
+        Epos = np.maximum(E, 0.0)
+        Cpos = np.maximum(C, 0.0)
+        Apos = np.maximum(A, 0.0)
+        ZCpos = np.maximum(ZC, 0.0)
+        ZApos = np.maximum(ZA, 0.0)
+        Dpos = np.maximum(D, 0.0)
+
+        solid = Cpos + Apos + ZCpos + ZApos + Dpos
+        phi = np.clip(1.0 - solid / S0, 0.0, 1.0)
+
+        diffE, Ereact = enzyme_front_diffusion(Epos, phi, De0, E_T)
+
+        r1 = k1 * Ereact * Cpos
+        rc = kc * ZCpos
+        rr = kr * ZCpos
+        r4 = k4 * Ereact * Apos
+        ra = ka * ZApos
+        re = ke * Dpos
+
+        dE = diffE - r1 + rc + rr - r4 + ra
+        dE[-1] = 0.0
+
+        dP = float(np.mean(re)) / S0
+
+        return np.concatenate(
+            [
+                np.vstack(
+                    [dE, -r1, rr - r4, r1 - rc - rr, r4 - ra, rc + ra - re]
+                ).reshape(-1),
+                np.array([dP]),
+            ]
+        )
+
+    y0 = np.concatenate(
+        [
+            np.vstack(
+                [
+                    np.full(N_GRID, E_INIT),
+                    np.full(N_GRID, X_FIXED * S0),
+                    np.full(N_GRID, (1.0 - X_FIXED) * S0),
+                    np.zeros(N_GRID),
+                    np.zeros(N_GRID),
+                    np.zeros(N_GRID),
+                ]
+            ).reshape(-1),
+            np.array([0.0]),
+        ]
+    )
+
+    sol = solve_ivp(
+        fun=rhs,
+        t_span=(float(times_h[0]), float(times_h[-1])),
+        y0=y0,
+        t_eval=times_h,
+        method="BDF",
+        rtol=RTOL,
+        atol=ATOL,
+        max_step=MAX_STEP,
+        jac_sparsity=jacobian_sparsity(),
+    )
+
+    if not sol.success or not np.all(np.isfinite(sol.y)):
+        raise RuntimeError("PDE solver failed: " + str(sol.message))
+
+    n_t = len(sol.t)
+
+    Yt = np.maximum(sol.y[:-1, :].T.reshape(n_t, 6, N_GRID), 0.0)
+
+    C, A, ZC, ZA, D = Yt[:, 1], Yt[:, 2], Yt[:, 3], Yt[:, 4], Yt[:, 5]
+    P = np.maximum(sol.y[-1, :], 0.0)
+
+    S = C + A + ZC + ZA + D
+    phi = np.clip(1.0 - S / S0, 0.0, 1.0)
+
+    WL = 100.0 * np.mean(phi, axis=1)
+    Xc = 100.0 * np.mean(C + ZC, axis=1) / np.maximum(np.mean(S, axis=1), 1.0e-14)
+    pH = PH0 - pars["alpha_pH"] * P
+
+    return WL, Xc, pH
+
+
+def theta_to_pars(theta_log10):
+    return dict(zip(NAMES, backtransform(theta_log10)))
+
+
+# ================================================================
+# LOG-POSTERIOR (logposterior.m)
+#   logpost = logprior + loglikelihood
+#   loglikelihood = -0.5 * sum ((y(theta) - y_data) / sigma)^2
+#   logprior = constant inside [lb, ub], -inf outside
+# ================================================================
+
+def make_logposterior(grade, lb, ub):
+
+    d = DATA[grade]
+
+    def logposterior(theta):
+
+        theta = np.asarray(theta, dtype=float)
+
+        if not (np.all(theta > lb) and np.all(theta < ub)):
+            return -np.inf
+
+        try:
+            WL, Xc, pH = simulate_model(grade, theta_to_pars(theta), T_MAIN)
+        except Exception:
+            return -np.inf
+
+        eps = np.concatenate(
+            [
+                (WL - d["wl_obs"]) / SIGMA["WL"],
+                (Xc - d["xc_obs"]) / SIGMA["Xc"],
+                (pH - d["ph_obs"]) / SIGMA["pH"],
+            ]
+        )
+
+        if not np.all(np.isfinite(eps)):
+            return -np.inf
+
+        return 1.0 - 0.5 * float(np.sum(eps ** 2))
+
+    return logposterior
+
+
+def search_domain(grade):
+
+    a0 = transform(np.array([THETA_PML[grade][p] for p in NAMES]))
+
+    if BOUNDS_MODE == "relative":
+        lb = a0 - np.log10(DELTA)
+        ub = a0 + np.log10(DELTA)
+    else:
+        lb = np.full(len(NAMES), np.log10(FIT_LOWER))
+        ub = np.full(len(NAMES), np.log10(FIT_UPPER))
+
+    return a0, lb, ub
+
+
+def inside(x, lb, ub):
+    """Reflect a state into the open search domain (needed because the
+    global theta_PML has rates on the upper bound)."""
+
+    x = np.asarray(x, dtype=float)
+    x = np.where(x > ub, 2.0 * ub - x, x)
+    x = np.where(x < lb, 2.0 * lb - x, x)
+
+    return np.clip(x, lb + 1.0e-9, ub - 1.0e-9)
+
+
+# ================================================================
+# GELMAN-RUBIN R (Gelman.m)
+# ================================================================
+
+def gelman_R(seq):
+    """seq: (n iterations, d parameters, m chains)"""
+
+    n, d, m = seq.shape
+
+    if n < 10:
+        return -2.0 * np.ones(d)
+
+    meanSeq = seq.mean(axis=0).T                 # m x d
+    B = n * meanSeq.var(axis=0, ddof=1)
+    W = np.mean([seq[:, :, k].var(axis=0, ddof=1) for k in range(m)], axis=0)
+    sigma2 = ((n - 1) / n) * W + B / n
+
+    return np.sqrt((m + 1) / m * sigma2 / W - (n - 1) / (m * n))
+
+
+# ================================================================
+# DE-MCz (DEMCz.m + Makedistribution.m), with checkpoints
+# ================================================================
+
+def run_demcz(grade, log=print):
+
+    rng = np.random.default_rng(SEED + 1000 * GRADE_ORDER.index(grade))
+
+    a0, lb, ub = search_domain(grade)
+    a0 = np.clip(a0, lb + EDGE_MARGIN, ub - EDGE_MARGIN)
+    logpost = make_logposterior(grade, lb, ub)
+
+    d = len(NAMES)
+    m = N_CHAINS
+    gamma = 2.38 / np.sqrt(2 * d)
+
+    case_dir = ROOT_OUTPUT_DIR / grade
+    case_dir.mkdir(parents=True, exist_ok=True)
+    ck_path = case_dir / f"{grade}_DEMCz_checkpoint.pkl"
+
+    if ck_path.exists():
+
+        with open(ck_path, "rb") as fh:
+            ck = pickle.load(fh)
+
+        states, cur_lp, Z, Zlp = ck["states"], ck["cur_lp"], ck["Z"], ck["Zlp"]
+        seq, R_hist = ck["seq"], ck["R_hist"]
+        accept, i_start = ck["accept"], ck["iteration"] + 1
+        mZ0 = ck["mZ0"]
+        rng.bit_generator.state = ck["rng_state"]
+
+        log(f"Resuming {grade} at iteration {i_start}")
+
+    else:
+
+        # initstate(j,:) = a0 + 0.001 randn
+        states = np.array(
+            [inside(a0 + INIT_SD * rng.standard_normal(d), lb, ub) for _ in range(m)]
+        )
+
+        # Z = initstate(1,:) .* (1 + 0.001 randn), 10*n + 1 rows
+        Z = np.array(
+            [inside(states[0] * (1.0 + INIT_SD * rng.standard_normal(d)), lb, ub)
+             for _ in range(10 * d + 1)]
+        )
+        mZ0 = Z.shape[0]
+        Zlp = np.full(mZ0, np.nan)
+
+        cur_lp = np.array([logpost(s) for s in states])
+
+        seq = np.zeros((0, d, m))
+        R_hist = []
+        accept = 0
+        i_start = 1
+
+        log(f"{grade}: initial log-posterior of chains {np.round(cur_lp, 3)}")
+
+    seq_list = [seq] if seq.size else []
+    t0 = time.time()
+
+    for i in range(i_start, N_ITER + 1):
+
+        for j in range(m):
+
+            mZ = Z.shape[0] - m          # exclude the m most recent rows
+            n1 = int(np.ceil(rng.random() * mZ)) - 1
+            n2 = int(np.ceil(rng.random() * (mZ - 1))) - 1
+            n1 = max(n1, 0)
+            n2 = max(n2, 0)
+            if n2 >= n1:
+                n2 += 1
+
+            proposal = (
+                states[j]
+                + gamma * (Z[n1] - Z[n2])
+                + JITTER * rng.standard_normal(d)
+            )
+
+            prop_lp = logpost(proposal)
+
+            if np.log(rng.random()) < prop_lp - cur_lp[j]:
+                states[j] = proposal
+                cur_lp[j] = prop_lp
+                accept += 1
+
+        seq_list.append(states.T[None, :, :].copy())
+
+        if i % N_THIN == 0:
+            Z = np.vstack([Z, states])
+            Zlp = np.concatenate([Zlp, cur_lp])
+
+        if i % GELMAN_EVERY == 0 or i == N_ITER:
+
+            seq = np.concatenate(seq_list, axis=0)
+            seq_list = [seq]
+
+            R = gelman_R(seq[int(round(i / 2)) - 1: i])
+            R_hist.append([i] + list(R))
+
+            el = time.time() - t0
+            log(
+                f"Iteration {i:6d}/{N_ITER} | accept = "
+                f"{accept / (i * m):.3f} | max R = {np.nanmax(R):.3f} | "
+                f"best logpost = {np.nanmax(Zlp):.3f} | {el:.0f} s this session"
+            )
+
+            tmp = ck_path.with_suffix(".tmp")
+            with open(tmp, "wb") as fh:
+                pickle.dump(
+                    {
+                        "states": states, "cur_lp": cur_lp, "Z": Z, "Zlp": Zlp,
+                        "seq": seq, "R_hist": R_hist, "accept": accept,
+                        "iteration": i, "mZ0": mZ0,
+                        "rng_state": rng.bit_generator.state,
+                    },
+                    fh,
+                )
+            tmp.replace(ck_path)
+
+    # saved states = Z without the initial archive
+    saved = Z[mZ0:]
+    saved_lp = Zlp[mZ0:]
+
+    # burn-in: bi = nit / nthin rows (Makedistribution.m)
+    bi = N_ITER // N_THIN
+    post = saved[bi:]
+    post_lp = saved_lp[bi:]
+
+    R_df = pd.DataFrame(R_hist, columns=["iteration"] + NAMES)
+
+    return {
+        "post": post,
+        "post_lp": post_lp,
+        "R": R_df,
+        "accept_rate": accept / (N_ITER * m),
+        "a0": a0,
+        "lb": lb,
+        "ub": ub,
+        "seq": seq,
+    }
+
+
+# ================================================================
+# PART II: PREDICTION ENVELOPE (makeY.m, plots.m)
+# ================================================================
+
+def predict(grade, theta, t, perturb=None):
+
+    pars = theta_to_pars(theta)
+
+    if perturb is not None:
+        name, factor = perturb
+        pars[name] = pars[name] * factor
+
+    WL, Xc, pH = simulate_model(grade, pars, t)
+
+    Y = np.column_stack([WL, Xc, pH])
+
+    return np.clip(Y, Y_FLOOR, Y_CEIL)        # makeY.m
+
+
+def predict_sample(grade, sample, t):
+    """Model predictions for every sampled parameter vector."""
+
+    preds = np.full((sample.shape[0], len(t), 3), np.nan)
+    failed = 0
+
+    for k, theta in enumerate(sample):
+
+        try:
+            preds[k] = predict(grade, theta, t)
+        except Exception:
+            failed += 1
+
+    return preds, failed
+
+
+def envelope(values):
+    """
+    plots.m: at each time point sort the N predictions, discard the
+    round((1-alpha) N/2) largest and (that + 1) smallest, min-max of rest.
+    """
+
+    v = values[np.all(np.isfinite(values), axis=1)]
+    N = v.shape[0]
+    ind2 = int(round((1 - ALPHA) * N / 2))
+
+    s = -np.sort(-v, axis=0)              # descending
+    kept = s[ind2: N - (ind2 + 1)]
+
+    return kept.min(axis=0), kept.max(axis=0), v.mean(axis=0)
+
+
+# ================================================================
+# ONE GRADE
+# ================================================================
+
+def analyse_grade(grade):
+
+    case_dir = ROOT_OUTPUT_DIR / grade
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = ROOT_OUTPUT_DIR / f"LOG_{grade}.txt"
+
+    def log(msg):
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(msg + "\n")
+        print(msg, flush=True)
+
+    warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+    # check theta_PML reproduces the deterministic fit
+    a0 = transform(np.array([THETA_PML[grade][p] for p in NAMES]))
+    WL, Xc, pH = simulate_model(grade, theta_to_pars(a0), T_MAIN)
+    d = DATA[grade]
+    sse = float(
+        np.sum((WL - d["wl_obs"]) ** 2)
+        + np.sum((Xc - d["xc_obs"]) ** 2)
+        + np.sum((pH - d["ph_obs"]) ** 2)
+    )
+    log(f"{grade}: SSE at theta_PML = {sse:.6f} (reference {REFERENCE_SSE[grade]:.6f})")
+
+    # ---------------- PART I ----------------
+    res = run_demcz(grade, log)
+
+    post, post_lp = res["post"], res["post_lp"]
+
+    rng = np.random.default_rng(SEED + 77 + GRADE_ORDER.index(grade))
+
+    # random draws with replacement (Main.m: ceil(rand*size(states,1)))
+    idx = rng.integers(0, post.shape[0], size=N_SAMPLE)
+    sample = post[idx]
+    sample_lp = post_lp[idx]
+
+    sample_lin = backtransform(sample)
+
+    pd.DataFrame(sample_lin, columns=NAMES).to_csv(
+        case_dir / f"{grade}_NIWA_sample_{N_SAMPLE}.csv", index=False
+    )
+    pd.DataFrame(backtransform(post), columns=NAMES).assign(
+        log_posterior=post_lp
+    ).to_csv(case_dir / f"{grade}_NIWA_all_post_burnin_states.csv", index=False)
+    res["R"].to_csv(case_dir / f"{grade}_NIWA_Gelman_R.csv", index=False)
+
+    # parameter summary from the sample
+    rows = []
+    for j, p in enumerate(NAMES):
+        v = sample_lin[:, j]
+        rows.append(
+            {
+                "Polymer": grade,
+                "Parameter": p,
+                "theta_PML": THETA_PML[grade][p],
+                "Posterior_mean": float(np.mean(v)),
+                "Posterior_median": float(np.median(v)),
+                "CI_2.5": float(np.percentile(v, 2.5)),
+                "CI_97.5": float(np.percentile(v, 97.5)),
+                "Final_Gelman_R": float(res["R"][p].iloc[-1]),
+            }
+        )
+    summary = pd.DataFrame(rows)
+    summary.to_csv(case_dir / f"{grade}_NIWA_parameter_summary.csv", index=False)
+
+    # 95 % credible region (plots.m): drop the 5 % least probable states
+    ind = int(round((1 - ALPHA) * N_SAMPLE))
+    order = np.argsort(sample_lp)              # ascending log-posterior
+    credible = sample_lin[order[ind:]]
+    pd.DataFrame(credible, columns=NAMES).to_csv(
+        case_dir / f"{grade}_NIWA_credible_region_states.csv", index=False
+    )
+
+    # ---------------- PART II ----------------
+    t_pred = np.linspace(0.0, T_FINAL, N_PRED_TIME)
+
+    log(f"{grade}: computing the prediction envelope for {N_SAMPLE} draws")
+    preds, failed = predict_sample(grade, sample, t_pred)
+    log(f"{grade}: failed integrations: {failed}")
+
+    band = {"time_h": t_pred}
+    for k, key in enumerate(["WL", "Xc", "pH"]):
+        lo, hi, mean = envelope(preds[:, :, k])
+        band[f"{key}_lower"] = lo
+        band[f"{key}_upper"] = hi
+        band[f"{key}_mean"] = mean
+    pd.DataFrame(band).to_csv(case_dir / f"{grade}_NIWA_envelope.csv", index=False)
+
+    out = {
+        "summary": summary,
+        "diagnostics": pd.DataFrame(
+            [{
+                "Polymer": grade,
+                "Chains": N_CHAINS,
+                "Iterations_per_chain": N_ITER,
+                "Thinning": N_THIN,
+                "Post_burnin_states": post.shape[0],
+                "Sample_size": N_SAMPLE,
+                "Acceptance_rate": res["accept_rate"],
+                "Max_final_Gelman_R": float(res["R"][NAMES].iloc[-1].max()),
+                "Bounds_mode": BOUNDS_MODE,
+                "sigma_WL": SIGMA["WL"], "sigma_Xc": SIGMA["Xc"], "sigma_pH": SIGMA["pH"],
+                "Failed_integrations": failed,
+            }]
+        ),
+    }
+
+    with open(ROOT_OUTPUT_DIR / f"{grade}_DONE.pkl", "wb") as fh:
+        pickle.dump(out, fh)
+
+    plot_grade_diagnostics(grade, res)
+
+    log(f"{grade}: finished")
+
+    return out
+
+
+# ================================================================
+# FIGURES
+# ================================================================
+
+def save_figure(fig, path, **kwargs):
+    """
+    Save a figure robustly on Windows: write to a temporary file and move
+    it into place, retrying if the target is locked (open in a viewer,
+    being synced by OneDrive, ...). If it stays locked, save under a new
+    name with a time stamp instead of stopping the run.
+    """
+
+    path = Path(path)
+    tmp = path.with_name(path.stem + "_tmp_writing" + path.suffix)
+
+    for attempt in range(6):
+        try:
+            fig.savefig(tmp, **kwargs)
+            os.replace(tmp, path)
+            return path
+        except OSError:
+            time.sleep(2)
+
+    alt = path.with_name(path.stem + time.strftime("_%Y%m%d_%H%M%S") + path.suffix)
+    fig.savefig(alt, **kwargs)
+    print(f"WARNING: {path.name} is locked by another program; saved as {alt.name}", flush=True)
+    return alt
+
+
+
+LABEL = {
+    "k1": r"$k_{\mathrm{bind},C}$",
+    "k4": r"$k_{\mathrm{bind},A}$",
+    "kc": r"$k_c$",
+    "ka": r"$k_a$",
+    "kr": r"$k_m$",
+    "ke": r"$k_e$",
+    "De0": r"$D_{e0}$",
+    "alpha_pH": r"$\alpha_{\mathrm{pH}}$",
+}
+
+THESIS_ORDER = ["k1", "k4", "kc", "ka", "kr", "ke", "De0", "alpha_pH"]
+RATES = ["k1", "k4", "kc", "ka", "kr", "ke"]
+
+COLOURS = {"PCL6300": "#1f77b4", "PCL6500": "#ff7f0e", "PCL6800": "#2ca02c"}
+
+
+def plot_grade_diagnostics(grade, res):
+
+    case_dir = ROOT_OUTPUT_DIR / grade
+
+    # Gelman R history (as in their Main.m figure, 1.2 reference line)
+    R = res["R"]
+    fig, axs = plt.subplots(2, 4, figsize=(14, 6), sharex=True)
+    for ax, p in zip(axs.ravel(), NAMES):
+        ax.plot(R["iteration"] * N_CHAINS, R[p])
+        ax.axhline(1.2, ls="--", color="tab:red")
+        ax.set_ylim(0.5, 1.5)
+        ax.set_title(LABEL[p])
+        ax.grid(alpha=0.3)
+    axs[1, 0].set_xlabel("Iterations")
+    axs[1, 0].set_ylabel("Scale reduction")
+    fig.tight_layout()
+    save_figure(fig, case_dir / f"{grade}_NIWA_Gelman_R.png", dpi=150)
+    plt.close(fig)
+
+    # trace plots of the m chains (log10 parameters)
+    seq = res["seq"]
+    fig, axs = plt.subplots(len(NAMES), 1, figsize=(10, 2 * len(NAMES)), sharex=True)
+    for k, p in enumerate(NAMES):
+        for c in range(seq.shape[2]):
+            axs[k].plot(seq[::max(1, seq.shape[0] // 4000), k, c], lw=0.5)
+        axs[k].set_ylabel(r"log$_{10}$ " + LABEL[p])
+        # burn-in = first N_ITER/N_THIN saved states = first N_ITER/N_CHAINS iterations
+        axs[k].axvline((N_ITER // N_CHAINS) / max(1, seq.shape[0] // 4000), color="k", ls="--")
+    axs[-1].set_xlabel("Iteration (subsampled)")
+    fig.tight_layout()
+    save_figure(fig, case_dir / f"{grade}_NIWA_trace.png", dpi=120)
+    plt.close(fig)
+
+
+def load_grade(grade):
+
+    case_dir = ROOT_OUTPUT_DIR / grade
+    f_s = case_dir / f"{grade}_NIWA_sample_{N_SAMPLE}.csv"
+    f_c = case_dir / f"{grade}_NIWA_credible_region_states.csv"
+    f_e = case_dir / f"{grade}_NIWA_envelope.csv"
+
+    if not (f_s.exists() and f_e.exists()):
+        return None
+
+    return {
+        "sample": pd.read_csv(f_s),
+        "credible": pd.read_csv(f_c) if f_c.exists() else pd.read_csv(f_s),
+        "envelope": pd.read_csv(f_e),
+    }
+
+
+def plot_predictions(loaded):
+
+    grades = list(loaded)
+
+    cols = [
+        ("WL", "wl_obs", "Weight loss", "Weight loss (%)"),
+        ("pH", "ph_obs", "pH", "Bath pH"),
+        ("Xc", "xc_obs", r"$X_c$", r"Remaining crystallinity, $X_c$ (%)"),
+    ]
+
+    fig, axs = plt.subplots(len(grades), 3, figsize=(13.5, 3.6 * len(grades)), squeeze=False)
+
+    for r, grade in enumerate(grades):
+
+        b = loaded[grade]["envelope"]
+        d = DATA[grade]
+
+        for c, (key, obs, title, ylab) in enumerate(cols):
+
+            ax = axs[r, c]
+
+            ax.fill_between(b["time_h"], b[f"{key}_lower"], b[f"{key}_upper"],
+                            color="#7fd17f", alpha=0.65, linewidth=0)
+
+            if SHOW_MEAN_LINE:
+                ax.plot(b["time_h"], b[f"{key}_mean"], color="red", lw=2.2)
+
+            ax.scatter(T_MAIN, d[obs], color="black", s=22, zorder=5)
+
+            if r == 0:
+                ax.set_title(title, fontsize=12)
+            ax.set_ylabel(f"{grade}\n{ylab}" if c == 0 else ylab, fontsize=10)
+            if r == len(grades) - 1:
+                ax.set_xlabel("Time (hours)", fontsize=10)
+            ax.set_xlim(-0.5, T_FINAL + 0.5)
+            ax.grid(alpha=0.3)
+            ax.tick_params(labelsize=8)
+
+    handles = [
+        plt.Line2D([0], [0], marker="o", color="black", ls="none", markersize=5),
+        plt.Rectangle((0, 0), 1, 1, color="#7fd17f", alpha=0.65),
+    ]
+    labels = ["Data", "95% prediction uncertainty"]
+    if SHOW_MEAN_LINE:
+        handles.append(plt.Line2D([0], [0], color="red", lw=2.2))
+        labels.append("Posterior mean")
+
+    fig.legend(handles, labels, loc="upper center", ncol=len(labels), frameon=False)
+    fig.tight_layout(rect=(0, 0, 1, 0.965))
+    save_figure(fig, ROOT_OUTPUT_DIR / "NIWA_predictions_all_grades.png", dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_rectangles(loaded, params, ncols, filename, ylabels):
+
+    grades = list(loaded)
+    nrows = int(np.ceil(len(params) / ncols))
+    fig, axs = plt.subplots(nrows, ncols, figsize=(4.6 * ncols, 3.9 * nrows), squeeze=False)
+
+    for k, p in enumerate(params):
+        ax = axs[k // ncols, k % ncols]
+        for j, g in enumerate(grades):
+            v = loaded[g]["sample"][p].to_numpy()
+            lo, hi = np.percentile(v, [2.5, 97.5])
+            ax.add_patch(plt.Rectangle((j - 0.3, lo), 0.6, hi - lo,
+                                       facecolor=COLOURS[g], edgecolor="none", alpha=0.9))
+            ax.plot([j - 0.3, j + 0.3], [v.mean()] * 2, color="red", lw=2)
+        ax.set_xlim(-0.6, len(grades) - 0.4)
+        ax.set_xticks(range(len(grades)))
+        ax.set_xticklabels(grades, fontsize=8)
+        ax.set_title(LABEL[p])
+        ax.set_ylabel(ylabels.get(p, "Parameter value"), fontsize=8)
+        ax.autoscale(axis="y")
+        ax.set_ylim(bottom=0)
+        ax.grid(axis="y", alpha=0.25)
+        ax.ticklabel_format(axis="y", style="sci", scilimits=(-3, 4))
+
+    for k in range(len(params), nrows * ncols):
+        axs[k // ncols, k % ncols].axis("off")
+
+    handles = [plt.Rectangle((0, 0), 1, 1, color=COLOURS[g]) for g in grades]
+    handles.append(plt.Line2D([0], [0], color="red", lw=2))
+    fig.legend(handles, grades + ["Posterior mean"], loc="upper center",
+               ncol=len(grades) + 1, frameon=False)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    save_figure(fig, ROOT_OUTPUT_DIR / filename, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_pairwise(loaded):
+    """
+    Consecutive parameter pairs (as in their plots.m), points = 95 %
+    credible region states, red star = posterior mean.
+    """
+
+    grades = list(loaded)
+    pairs = list(zip(THESIS_ORDER[:-1], THESIS_ORDER[1:]))
+    nc, nr = 3, int(np.ceil(len(pairs) / 3))
+
+    fig = plt.figure(figsize=(4.2 * nc * len(grades) / 1.6, 2.6 * nr))
+    outer = fig.add_gridspec(1, len(grades), wspace=0.18)
+
+    for gi, g in enumerate(grades):
+        inner = outer[gi].subgridspec(nr, nc, wspace=0.55, hspace=0.55)
+        df = loaded[g]["credible"]
+        mean = loaded[g]["sample"].mean()
+        for k, (px, py) in enumerate(pairs):
+            ax = fig.add_subplot(inner[k // nc, k % nc])
+            ax.scatter(df[px], df[py], s=3, color="blue", alpha=0.45)
+            ax.scatter([mean[px]], [mean[py]], marker="*", s=90, color="red", zorder=5)
+            ax.set_xlabel(LABEL[px], fontsize=8)
+            ax.set_ylabel(LABEL[py], fontsize=8)
+            ax.tick_params(labelsize=6)
+            ax.ticklabel_format(style="sci", scilimits=(-2, 3))
+            ax.xaxis.get_offset_text().set_fontsize(6)
+            ax.yaxis.get_offset_text().set_fontsize(6)
+            ax.grid(alpha=0.25)
+            if k == 1:
+                ax.set_title(g, fontsize=11, fontweight="bold")
+
+    save_figure(fig, ROOT_OUTPUT_DIR / "NIWA_pairwise_posterior_all_grades.png", dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_correlation(loaded):
+
+    grades = list(loaded)
+    fig, axs = plt.subplots(1, len(grades), figsize=(5.2 * len(grades), 5.0), squeeze=False)
+    im = None
+
+    for gi, g in enumerate(grades):
+        ax = axs[0, gi]
+        c = loaded[g]["sample"][THESIS_ORDER].corr().to_numpy()
+        im = ax.imshow(c, cmap="RdBu_r", vmin=-1, vmax=1)
+        for a in range(len(THESIS_ORDER)):
+            for b in range(len(THESIS_ORDER)):
+                ax.text(b, a, f"{c[a, b]:.2f}", ha="center", va="center", fontsize=6,
+                        color="white" if abs(c[a, b]) > 0.6 else "black")
+        lab = [LABEL[p] for p in THESIS_ORDER]
+        ax.set_xticks(range(len(lab)))
+        ax.set_yticks(range(len(lab)))
+        ax.set_xticklabels(lab, fontsize=8)
+        ax.set_yticklabels(lab, fontsize=8)
+        ax.set_title(g, fontweight="bold")
+
+    cb = fig.colorbar(im, ax=axs.ravel().tolist(), fraction=0.015, pad=0.02)
+    cb.set_label("Pearson correlation")
+    save_figure(fig, ROOT_OUTPUT_DIR / "NIWA_posterior_correlation_all_grades.png", dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+
+
+def make_figures():
+
+    loaded = {g: x for g in GRADE_ORDER if (x := load_grade(g)) is not None}
+
+    if not loaded:
+        return
+
+    plot_predictions(loaded)
+    plot_rectangles(loaded, RATES, 3, "NIWA_rate_parameters_95CI_all_grades.png",
+                    {p: r"Parameter value (h$^{-1}$)" for p in RATES})
+    plot_rectangles(loaded, ["De0", "alpha_pH"], 2, "NIWA_De0_alphapH_95CI_all_grades.png",
+                    {"De0": r"$D_{e0}$ (mm$^2$ h$^{-1}$)",
+                     "alpha_pH": "pH units per free-product unit"})
+    plot_pairwise(loaded)
+    plot_correlation(loaded)
+
+
+def write_master():
+
+    outs = []
+    for g in GRADE_ORDER:
+        f = ROOT_OUTPUT_DIR / f"{g}_DONE.pkl"
+        if f.exists():
+            with open(f, "rb") as fh:
+                outs.append(pickle.load(fh))
+
+    if not outs:
+        return
+
+    xlsx = ROOT_OUTPUT_DIR / "MA_NIWA_vanMourik_50k_RESULTS.xlsx"
+
+    try:
+        with open(xlsx, "ab"):
+            pass
+    except OSError:
+        xlsx = xlsx.with_name(xlsx.stem + time.strftime("_%Y%m%d_%H%M%S") + xlsx.suffix)
+        print(f"WARNING: results workbook is open in another program; writing {xlsx.name}", flush=True)
+
+    with pd.ExcelWriter(xlsx) as w:
+        pd.concat([o["summary"] for o in outs]).to_excel(w, sheet_name="Parameters", index=False)
+        pd.concat([o["diagnostics"] for o in outs]).to_excel(w, sheet_name="Diagnostics", index=False)
+        pd.DataFrame(
+            {"Setting": ["Chains", "Iterations per chain", "Thinning", "Burn-in",
+                         "Sample size", "alpha", "Bounds", "sigma WL", "sigma Xc",
+                         "sigma pH", "Reference"],
+             "Value": [N_CHAINS, N_ITER, N_THIN, "first N_ITER/N_THIN saved states",
+                       N_SAMPLE, ALPHA,
+                       BOUNDS_MODE if BOUNDS_MODE != "relative" else f"PML/{DELTA:g} to PML*{DELTA:g}",
+                       SIGMA["WL"], SIGMA["Xc"], SIGMA["pH"],
+                       "van Mourik et al. (2014) PeerJ 2:e433"]}
+        ).to_excel(w, sheet_name="Settings", index=False)
+
+
+# ================================================================
+# RUN GRADES (in parallel when possible)
+# ================================================================
+
+def this_script():
+    try:
+        p = Path(__file__).resolve()
+        return p if p.exists() else None
+    except NameError:
+        return None
+
+
+def run_all():
+
+    pending = [g for g in GRADE_ORDER if not (ROOT_OUTPUT_DIR / f"{g}_DONE.pkl").exists()]
+
+    print(
+        f"NIWA / van Mourik et al. (2014) | chains = {N_CHAINS}, iterations = {N_ITER}, "
+        f"thin = {N_THIN}, sample = {N_SAMPLE} | bounds = {BOUNDS_MODE} | "
+        f"grades to run: {pending}",
+        flush=True,
+    )
+
+    script = this_script()
+
+    if N_PARALLEL > 1 and len(pending) > 1 and script is not None:
+
+        import subprocess
+
+        procs = {}
+        queue = list(pending)
+        last = 0.0
+
+        while queue or procs:
+
+            while queue and len(procs) < N_PARALLEL:
+                g = queue.pop(0)
+                fh = open(ROOT_OUTPUT_DIR / f"STDOUT_{g}.txt", "a")
+                procs[g] = (subprocess.Popen(
+                    [sys.executable, "-u", str(script), "--grade", g],
+                    stdout=fh, stderr=subprocess.STDOUT, cwd=str(script.parent)), fh)
+                print(f"STARTED  | {g}", flush=True)
+
+            for g in list(procs):
+                p, fh = procs[g]
+                if p.poll() is not None:
+                    fh.close()
+                    del procs[g]
+                    ok = (ROOT_OUTPUT_DIR / f"{g}_DONE.pkl").exists()
+                    print(f"{'FINISHED' if ok else 'ERROR   '} | {g}", flush=True)
+                    make_figures()
+                    write_master()
+
+            if procs and time.time() - last > 600:
+                last = time.time()
+                print(time.strftime("[%H:%M] progress"), flush=True)
+                for g in procs:
+                    try:
+                        lines = (ROOT_OUTPUT_DIR / f"LOG_{g}.txt").read_text().splitlines()
+                        print(f"   {g}: {lines[-1] if lines else 'starting'}", flush=True)
+                    except OSError:
+                        print(f"   {g}: starting", flush=True)
+
+            time.sleep(5)
+
+    elif N_PARALLEL > 1 and len(pending) > 1:
+
+        try:
+            from joblib import Parallel, delayed
+            print("Interactive run: joblib workers. Progress in LOG_*.txt", flush=True)
+            Parallel(n_jobs=min(N_PARALLEL, len(pending)), backend="loky", verbose=10)(
+                delayed(analyse_grade)(g) for g in pending)
+        except ImportError:
+            for g in pending:
+                analyse_grade(g)
+
+    else:
+
+        for g in pending:
+            analyse_grade(g)
+
+    make_figures()
+    write_master()
+
+    print(f"\nDONE. Results in {ROOT_OUTPUT_DIR}", flush=True)
+
+
+if __name__ == "__main__":
+
+    if "--grade" in sys.argv:
+        analyse_grade(sys.argv[sys.argv.index("--grade") + 1])
+    elif "--figures-only" in sys.argv:
+        make_figures()
+        write_master()
+    else:
+        run_all()
